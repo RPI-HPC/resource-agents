@@ -1,0 +1,404 @@
+#! /bin/bash
+#
+#
+#	WrapInitScript OCF RA. Wraps an init script so it can behave
+#	like an OCF resource.  If the init script doesn't exist on the
+#	node, the service is considered to be down -- this can be used
+#	on asymmetrical clusters, where not every node has the
+#	software with the init script.
+#
+# Copyright (c) 2013 by Rensselaer Polytechnic Institute.
+#                       All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+
+#######################################################################
+# Initialization:
+
+. ${OCF_ROOT}/resource.d/heartbeat/.ocf-shellfuncs
+
+#######################################################################
+
+# Define default valus.
+
+OCF_RESKEY_startmethod_default="start"
+OCF_RESKEY_startwait_default="0"
+OCF_RESKEY_stopmethod_default="stop"
+OCF_RESKEY_stopwait_default="0"
+OCF_RESKEY_statusmethod_default="status"
+OCF_RESKEY_statuschecklsb_default="false"
+
+
+# Metadata
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="WrapInitScript" version="1.0">
+<version>1.0</version>
+
+<longdesc lang="en">
+This resource wraps an init script so it can behave like an OCF
+resource.  If the init script doesn't exist on the node, the service
+is considered to be down -- this can be used on asymmetrical clusters,
+where not every node has the software with the init script.
+
+Some init scripts do not conform to the LSB standards.  This wrapper
+provides escapes that can be used to work around non-conforming or
+exotic behavior.  Of course, if the work arounds become complicated,
+it may be more appropriate to write a specialized resource agent for
+the service.
+</longdesc>
+<shortdesc lang="en">read attributes from a file</shortdesc>
+
+<parameters>
+
+<parameter name="initscript" unique="0" required="1">
+<longdesc lang="en">
+
+Full pathname of the init script.
+
+</longdesc>
+<shortdesc lang="en">Full pathname of the init script</shortdesc>
+<content type="string" />
+</parameter>
+
+
+<parameter name="startmethod" unique="0" required="0">
+<longdesc lang="en">
+
+Name of the init script method to start the service.
+
+</longdesc>
+<shortdesc lang="en">Name of method to start the service</shortdesc>
+<content type="string" default="$OCF_RESKEY_startmethod_default" />
+</parameter>
+
+
+<parameter name="startwait" unique="0" required="0">
+<longdesc lang="en">
+
+Indicate how long to wait after the status check indicates the service
+is started, in seconds.  Some services may lie, but a little extra
+time will be enough to really get them started.  Make sure the start
+timeout is long enough!
+
+</longdesc>
+<shortdesc lang="en">Seconds to wait after service claims to be running</shortdesc>
+<content type="integer" default="$OCF_RESKEY_startwait_default" />
+</parameter>
+
+
+<parameter name="stopmethod" unique="0" required="0">
+<longdesc lang="en">
+
+Name of the init script method to stop the service.
+
+</longdesc>
+<shortdesc lang="en">Name of method to stop the service</shortdesc>
+<content type="string" default="$OCF_RESKEY_stopmethod_default" />
+</parameter>
+
+
+<parameter name="stopwait" unique="0" required="0">
+<longdesc lang="en">
+
+Indicate how long to wait after the status check indicates the service
+is stopped, in seconds.  Some services may lie, but a little extra
+time will be enough to really get them stopped.  Make sure the stop
+timeout is long enough!
+
+</longdesc>
+<shortdesc lang="en">Seconds to wait after service claims to be stopped</shortdesc>
+<content type="integer" default="$OCF_RESKEY_stopwait_default" />
+</parameter>
+
+
+<parameter name="statusmethod" unique="0" required="0">
+<longdesc lang="en">
+
+Name of the init script method to check status of the service.
+
+</longdesc>
+<shortdesc lang="en">Name of method to check status of the service</shortdesc>
+<content type="string" default="$OCF_RESKEY_statusmethod_default" />
+</parameter>
+
+
+<parameter name="statuscheck" unique="0" required="0">
+<longdesc lang="en">
+
+Commands to use to check status of service instead of init script.
+
+</longdesc>
+<shortdesc lang="en">Commands to use to check status of service</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="statuschecklsb" unique="0" required="0">
+<longdesc lang="en">
+
+Indicate whether the status check commands or method gives
+LSB-compliant results.  If set to "true", then the status check should
+return: 0 - the service is running normally, 3 - the service is
+cleanly stopped, other non-zero - the service is not running (or
+unknown) due to some error.  An LSB-compliant status check will
+distinguish between cleanly-stopped and improperly-stopped.
+
+If the status check is not LSB-compliant, than any non-zero exit code
+will be considered an indication that the service is not running.
+
+</longdesc>
+<shortdesc lang="en">Indicate if status check is LSB compliant</shortdesc>
+<content type="boolean" default="$OCF_RESKEY_statuschecklsb_default" />
+</parameter>
+
+
+<parameter name="reloadmethod" unique="0" required="0">
+<longdesc lang="en">
+
+Name of the init script method to reload (or restart) the service.
+Common values would be "reload" or "restart".  If this is not set,
+then a stop, followed by a start, will be executed.
+
+</longdesc>
+<shortdesc lang="en">Name of method to reload the service</shortdesc>
+<content type="string" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="20s" />
+<action name="stop"         timeout="20s" />
+<action name="monitor"      timeout="20s" interval="60s" depth="0"/>
+<action name="reload"       timeout="30s" />
+<action name="validate-all" timeout="20s" />
+<action name="meta-data"    timeout="5s" />
+</actions>
+</resource-agent>
+END
+}
+
+# Get the variables we need
+process="$OCF_RESKEY_INSTANCE"
+initscript="$OCF_RESKEY_initscript"
+startmethod="${OCF_RESKEY_startmethod:-${OCF_RESKEY_startmethod_default}}"
+startwait="${OCF_RESKEY_startwait:-${OCF_RESKEY_startwait_default}}"
+stopmethod="${OCF_RESKEY_stopmethod:-${OCF_RESKEY_stopmethod_default}}"
+stopwait="${OCF_RESKEY_stopwait:-${OCF_RESKEY_stopwait_default}}"
+statusmethod="${OCF_RESKEY_statusmethod:-${OCF_RESKEY_statusmethod_default}}"
+statuscheck="$OCF_RESKEY_statuscheck"
+statuschecklsb="${OCF_RESKEY_statuschecklsb_default:-${OCF_RESKEY_statuschecklsb_default}}"
+reloadmethod="$OCF_RESKEY_reloadmethod"
+
+#
+
+wrap_usage() {
+    cat <<EOF
+usage: $0  {start|stop|monitor|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+EOF
+}
+
+wrap_validate() {
+
+    # If the init script exists but is not executable, that is bad.
+    if [ -f "$initscript" ]; then
+	if [ ! -x "$initscript" ]; then
+	    ocf_log err "Script $initscript exists but is not executable."
+	    exit $OCF_ERR_PERM
+	fi
+    fi
+
+    return $OCF_SUCCESS
+}
+
+
+wrap_status() {
+    local rc
+    # Validate.
+    wrap_validate || exit $?
+
+    # Does the init script exist?  If not, then we are stopped.
+    if [ ! -f "$initscript" ]; then
+	ocf_log info "No initscript"
+	return $OCF_NOT_RUNNING
+    fi
+
+    # Are there statuscheck commands?  Then run them.  Success means
+    # the service is running, failure that it is not.
+    if [ -n "$statuscheck" ]; then
+	ocf_run -q $statuscheck 
+	rc=$?
+	if ocf_is_true $statuschecklsb ; then
+	    if [ $rc -eq 0 ]; then
+		return $OCF_SUCCESS
+	    elif [ $rc -eq 3 ]; then
+		return $OCF_NOT_RUNNING
+	    else
+		return $OCF_ERR_GENERIC
+	    fi
+	elif [ $rc -ne 0 ]; then
+	    return $OCF_NOT_RUNNING
+	else
+	    return $OCF_SUCCESS
+	fi
+    fi
+
+    # Use the init script.
+    ocf_run -q $initscript $statusmethod
+    rc=$?
+    if ocf_is_true $statuschecklsb ; then
+	if [ $rc -eq 0 ]; then
+	    return $OCF_SUCCESS
+	elif [ $rc -eq 3 ]; then
+	    return $OCF_NOT_RUNNING
+	else
+	    return $OCF_ERR_GENERIC
+	fi
+    elif [ $rc -ne 0 ]; then
+	return $OCF_NOT_RUNNING
+    else
+	return $OCF_SUCCESS
+    fi
+}
+
+
+wrap_start() {
+    local rc
+    ocf_log info "Try starting $initscript"
+
+    # If already running, or no init script, then do not start.
+    wrap_status && return $OCF_SUCCESS
+    rc=$?
+    [ $rc -ne $OCF_NOT_RUNNING ] && exit $rc
+    [ ! -f "$initscript" ] && exit $OCF_ERR_INSTALLED
+
+    # Start the service.
+    ha_pseudo_resource wrap-$process start
+    ocf_run -q $initscript $startmethod || exit $OCF_ERR_GENERIC
+
+    # Wait until status indicates it is running
+    while ! wrap_status; do
+	sleep 1
+    done
+
+    # Optional sleep..
+    sleep $startwait
+
+    return $OCF_SUCCESS
+}
+
+
+wrap_stop() {
+    local rc
+
+    # Check current state.  Success if stopped.
+    wrap_status
+    rc=$?
+    case $rc in
+	$OCF_SUCCESS)
+	    ;;
+	$OCF_NOT_RUNNING)
+	    ocf_log info "Resource is already stopped."
+	    ha_pseudo_resource wrap-$process stop
+	    return $OCF_SUCCESS
+	    ;;
+	*)
+	    exit $rc
+	    ;;
+    esac
+
+    # It seems to be running.  Stop it.
+    ocf_run -q $initscript $stopmethod || exit $OCF_ERR_GENERIC
+
+    # Wait for it to stop.
+    while wrap_status ; do
+	sleep 1
+    done
+
+    # Optional sleep..
+    sleep $stopwait
+
+    ha_pseudo_resource wrap-$process stop
+    return $OCF_SUCCESS
+}
+
+wrap_monitor () {
+    local rc
+
+    wrap_status
+    rc=$?
+    case $rc in
+	$OCF_SUCCESS)
+	    return $OCF_SUCCESS
+	    ;;
+	$OCF_NOT_RUNNING)
+	    ha_pseudo_resource wrap-$process status && return $OCF_ERR_GENERIC
+	    return $OCF_NOT_RUNNING
+	    ;;
+	*)
+	    return $rc
+	    ;;
+    esac
+}
+
+wrap_reload () {
+
+    # Is the service already running?  Only use reload if it is running.
+    if wrap_status; then
+	if [ -z "$reloadmethod" ]; then
+	    ocf_log info "Reload $process by stop, start"
+	    wrap_stop
+	    wrap_start
+	else
+	    ocf_run -q $initscript $reloadmethod || exit $OCF_ERR_GENERIC
+	    # FIXME: Sleep?
+	    return $OCF_SUCCESS
+	fi
+    else
+	# It isn't running, so just start.
+	wrap_start
+    fi
+}
+
+# Main program.
+case $__OCF_ACTION in
+meta-data)	meta_data
+		exit $OCF_SUCCESS
+		;;
+start)		wrap_start;;
+stop)		wrap_stop;;
+monitor)	wrap_monitor;;
+reload)		wrap_reload;;
+validate-all)	wrap_validate;;
+usage|help)	wrap_usage
+		exit $OCF_SUCCESS
+		;;
+*)		wrap_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc

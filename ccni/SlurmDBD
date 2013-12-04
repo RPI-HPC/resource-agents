@@ -1,0 +1,257 @@
+#! /bin/bash
+#
+#
+#	SlurmDBD OCF RA. Attempts to start the Slurm database daemon
+#	and keep it running.
+#
+# Copyright (c) 2013 by Rensselaer Polytechnic Institute.
+#                       All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+
+#######################################################################
+# Initialization:
+
+. ${OCF_ROOT}/resource.d/heartbeat/.ocf-shellfuncs
+
+#######################################################################
+
+# Define default values.
+OCF_RESKEY_confdir_default="/etc/slurm"
+OCF_RESKEY_sbindir_default="/usr/sbin"
+OCF_RESKEY_libdir_default="/usr/lib64"
+OCF_RESKEY_pidfile_default="/var/run/slurmdbd.pid"
+
+
+# Metadata
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="SlurmDBD" version="1.0">
+<version>1.0</version>
+
+<longdesc lang="en">
+This is the SlurmDBD Resource Agent.  It starts the Slurm database
+daemon and watches that it remains active.
+</longdesc>
+<shortdesc lang="en">SlurmDBD resource agent</shortdesc>
+
+<parameters>
+
+<parameter name="confdir" unique="0" required="0">
+<longdesc lang="en">
+Location of the slurm configuration directory.  By default, the slurm
+configuration file will be found in this directory.
+</longdesc>
+<shortdesc lang="en">Location of the slurm configuration directory.</shortdesc>
+<content type="string" default="$OCF_RESKEY_confdir_default" />
+</parameter>
+
+<parameter name="sbindir" unique="0" required="0">
+<longdesc lang="en">
+Location of the slurm system binary directory.  By default, the
+slurmdbd executable will be found in this directory.
+</longdesc>
+<shortdesc lang="en">Location of the slurm system binary directory.</shortdesc>
+<content type="string" default="$OCF_RESKEY_sbindir_default" />
+</parameter>
+
+<parameter name="libdir" unique="0" required="0">
+<longdesc lang="en">
+Location of the slurm/munge shared library directory.
+</longdesc>
+<shortdesc lang="en">Location of the slurm/munge shared library directory.</shortdesc>
+<content type="string" default="$OCF_RESKEY_libdir_default" />
+</parameter>
+
+<parameter name="slurmdbd" unique="0" required="0">
+<longdesc lang="en">
+Location of the slurmdbd binary.  By default, the slurmdbd executable
+will be found as slurmdbd in the sbndir directory.
+</longdesc>
+<shortdesc lang="en">Location of the slurmdbd binary.</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="pidfile" unique="0" required="0">
+<longdesc lang="en">
+Where to write the pid file of the daemon.  This can be overridden by
+the PidFile entry in the slurmdbd.conf file.
+</longdesc>
+<shortdesc lang="en">Where to write the pid file of the daemon.</shortdesc>
+<content type="string" default="$OCF_RESKEY_pidfile_default" />
+</parameter>
+
+<parameter name="niceness" unique="0" required="0">
+<longdesc lang="en">
+Nice value to apply to the slurmdbd daemon (typically negative).
+</longdesc>
+<shortdesc lang="en">Nice value to apply to the slurmdbd daemon </shortdesc>
+<content type="string" default="" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="30s" />
+<action name="stop"         timeout="20s" />
+<action name="monitor"      timeout="20s" interval="60s" depth="0"/>
+<action name="reload"       timeout="30s" />
+<action name="validate-all" timeout="20s" />
+<action name="meta-data"    timeout="5s" />
+</actions>
+</resource-agent>
+END
+}
+
+
+
+# Get the variables we need.
+process="$OCF_RESKEY_INSTANCE"
+confdir="${OCF_RESKEY_confdir:-${OCF_RESKEY_confdir_default}}"
+sbindir="${OCF_RESKEY_sbindir:-${OCF_RESKEY_sbindir_default}}"
+libdir="${OCF_RESKEY_libdir:-${OCF_RESKEY_libdir_default}}"
+niceness="${OCF_RESKEY_niceness}"
+#
+slurmdbd="${OCF_RESKEY_slurmdbd:-${sbindir}/slurmdbd}"
+
+# Get the pid file.  (Based on test from slurmdbd.init)
+pidfile="$(grep -i pidfile "${confdir}/slurmdbd.conf" 2>/dev/null | egrep -v '^ *#')"
+if [ $? -eq 0 ]; then
+    # Reduce -- get path name, take of trailing comments
+    pidfile=${pidfile##*=}
+    pidfile=${pidfile%#*}
+else
+    # Set a default
+    pidfile="${OCF_RESKEY_pidfile:-${OCF_RESKEY_pidfile_default}}"
+fi
+
+slurm_usage() {
+    cat <<EOF
+usage: $0  {start|stop|monitor|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+EOF
+}
+
+slurm_validate() {
+    check_binary $slurmdbd
+
+    [ -r ${confdir}/slurmdbd.conf ] || return $OCF_ERR_INSTALLED
+
+    # Can we write the pid file?
+    [ -w $(dirname "${pidfile}") ] || return $OCF_ERR_PERM
+
+    return $OCF_SUCCESS
+}
+
+slurm_status() {
+    # Validate.
+    slurm_validate || exit $?
+
+    # Does the pid file exist?  Then check if the pid it lists is a
+    # running pid for slurmdbd.  (Uses tests similar to init script)
+    pid=$(pidof -o $$ -o $$PPID -o %PPID -x $slurmdbd)
+    [ -f "$pidfile" ] || return $OCF_NOT_RUNNING
+    read rpid < $pidfile
+    for p in $pid; do
+	if [ "$p" = "$rpid" ]; then
+	    return $OCF_SUCCESS
+	fi
+    done
+
+    # Pid file, but process is gone.
+    return $OCF_ERR_GENERIC
+}
+
+slurm_start() {
+    # Validate.
+    slurm_validate || exit $?
+
+    # If already running, then do no more.
+    if slurm_status; then
+	return $OCF_SUCCESS
+    fi
+
+    export LD_LIBRARY_PATH=$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    unset HOME MAIL USER USERNAME
+    N=${niceness:+-n "${niceness}"}
+    ocf_run ${slurmdbd} $N || exit $OCF_ERR_GENERIC
+
+    # Spin until started.
+    while ! slurm_status; do
+	sleep 5
+    done
+
+    return $OCF_SUCCESS
+}
+
+slurm_stop() {
+    # Validate.
+    slurm_validate || exit $?
+
+    # If already stopped, then do no more.
+    slurm_status || {
+	return $OCF_SUCCESS
+    }
+
+    # Get the pid.  Kill it.
+    read rpid < $pidfile
+    kill "$rpid"
+
+    # Spin until stopped.
+    while slurm_status; do
+	sleep 5
+    done
+
+    return $OCF_SUCCESS
+}
+
+slurm_monitor() {
+    slurm_status
+    return $?
+}
+
+
+# Main program
+case $__OCF_ACTION in
+meta-data)	meta_data
+		exit $OCF_SUCCESS
+		;;
+start)		slurm_start;;
+stop)		slurm_stop;;
+monitor)	slurm_monitor;;
+reload)		ocf_log err "Reloading..."
+	        slurm_stop
+	        slurm_start
+		;;
+validate-all)	slurm_validate;;
+usage|help)	slurm_usage
+		exit $OCF_SUCCESS
+		;;
+*)		slurm_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc

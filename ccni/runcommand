@@ -1,0 +1,343 @@
+#! /bin/bash
+#
+#
+#	runcommand OCF RA. Runs a script when it starts, or the script
+#	variable is reloaded.  Using an interval on "start" can cause
+#	this to run periodically.
+#
+# Copyright (c) 2013 by Rensselaer Polytechnic Institute.
+#                       All rights reserved.
+# Copyright (c) 2004 SUSE LINUX AG, Lars Marowsky-Brée
+#                    All Rights Reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+
+#######################################################################
+# Initialization:
+
+. ${OCF_ROOT}/resource.d/heartbeat/.ocf-shellfuncs
+
+#######################################################################
+
+# Define default values
+OCF_RESKEY_startcommand_default="/bin/true"
+#OCF_RESKEY_startcommand_default="mkdir -p './x y z'"
+OCF_RESKEY_stopcommand_default="/bin/true"
+OCF_RESKEY_probecommand_default="/bin/true"
+OCF_RESKEY_user_default="root"
+OCF_RESKEY_workdir_default="/tmp"
+OCF_RESKEY_pidfile_default="${HA_RSCTMP}/runcommand_${OCF_RESOURCE_INSTANCE}.pid"
+
+# Metadata
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="runcommand" version="1.0">
+<version>1.0</version>
+
+<longdesc lang="en">
+This is the runcommand Resource Agent. It runs commands when it starts, and
+can periodically run another set of commands.
+</longdesc>
+<shortdesc lang="en">Runcommand resource agent</shortdesc>
+
+<parameters>
+
+<parameter name="startcommand" unique="0" required="0">
+<longdesc lang="en">
+Command to run once, at start time, and maybe repeated
+</longdesc>
+<shortdesc lang="en">One-time start command</shortdesc>
+<content type="string" default="$OCF_RESKEY_startcommand_default" />
+</parameter>
+
+<parameter name="repeatcommand" unique="0" required="0">
+<longdesc lang="en">
+Command to run repeatedly.  If a repeat time is given but no
+repeatcommand, then the startcommand is used.
+</longdesc>
+<shortdesc lang="en">Repeated command</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="repeat" unique="0" required="0" >
+<longdesc lang="en">
+Interval (understood by GNU date) to compute repetition time.
+</longdesc>
+<shortdesc lang="en">Repeated command</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="stopcommand" unique="0" required="0">
+<longdesc lang="en">
+Command to run once, at stop time.
+</longdesc>
+<shortdesc lang="en">One-time stop command</shortdesc>
+<content type="string" default="$OCF_RESKEY_stopcommand_default" />
+</parameter>
+
+<parameter name="probecommand" unique="0" required="0">
+<longdesc lang="en">
+Command to run when monitoring to probe status
+</longdesc>
+<shortdesc lang="en">Probe command for monitoring</shortdesc>
+<content type="string" default="$OCF_RESKEY_probecommand_default" />
+</parameter>
+
+<parameter name="user" required="0" >
+<longdesc lang="en">
+User to run the command as
+</longdesc>
+<shortdesc lang="en">User to run the command as</shortdesc>
+<content type="string" default="$OCF_RESKEY_user_default"/>
+</parameter>
+
+<parameter name="workdir" required="0" unique="0" >
+<longdesc lang="en">
+The path from where the commands will be executed.
+</longdesc>
+<shortdesc lang="en">Full path name of the work directory</shortdesc>
+<content type="string" default="$OCF_RESKEY_workdir_default"/>
+</parameter>
+
+<parameter name="pidfile" required="0" unique="0" >
+<longdesc lang="en">
+File to read/write the PID from/to.
+</longdesc>
+<shortdesc lang="en">File to write STDOUT to</shortdesc>
+<content type="string" default="$OCF_RESKEY_pidfile_default"/>
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="30s" />
+<action name="stop"         timeout="20s" />
+<action name="monitor"      timeout="20s" interval="60s" depth="0"/>
+<action name="reload"       timeout="30s" />
+<action name="migrate_to"   timeout="30s" />
+<action name="migrate_from" timeout="30s" />
+<action name="validate-all" timeout="20s" />
+<action name="meta-data"    timeout="5s" />
+</actions>
+</resource-agent>
+END
+}
+
+#######################################################################
+#
+# Additional functions
+
+_runcommand_calctime() {
+    s=$(expr "$1" : '\([0-9][0-9]*\) *s$') ||
+    s=$(expr 60 \* $(expr "$1" : '\([0-9][0-9]*\) *m$') 2>/dev/null) ||
+    s=$(expr 3600 \* $(expr "$1" : '\([0-9][0-9]*\) *h$') 2>/dev/null) ||
+    s=$(expr 86400 \* $(expr "$1" : '\([0-9][0-9]*\) *d$') 2>/dev/null) ||
+    s=$(expr "$1" : '^\([0-9][0-9]*\)$') || {
+	sn=$(date '+%s')
+	sw=$(date --date "$1" '+%s') || return 1
+	s=$(expr $sw - $sn)
+	[ $s -lt 0 ] || s=0
+    }
+    echo $s
+}
+
+_runcommand_getpid() {
+    grep -o '[0-9][0-9]*' "$1"
+}
+
+
+#######################################################################
+
+# don't exit on TERM, to test that lrmd makes sure that we do exit
+trap sigterm_handler TERM
+sigterm_handler() {
+	ocf_log info "They use TERM to bring us down. No such luck."
+	return
+}
+
+# Get the variables we need
+process="$OCF_RESOURCE_INSTANCE"
+startcommand="${OCF_RESKEY_startcommand:-${OCF_RESKEY_startcommand_default}}"
+repeatcommand="${OCF_RESKEY_repeatcommand:-${startcommand}}"
+repeat="$OCF_RESKEY_repeat"
+stopcommand="${OCF_RESKEY_stopcommand:=${OCF_RESKEY_stopcommand_default}}"
+probecommand="${OCF_RESKEY_probecommand:=${OCF_RESKEY_probecommand_default}}"
+user="${OCF_RESKEY_user:-${OCF_RESKEY_user_default}}"
+workdir="${OCF_RESKEY_workdir:-${OCF_RESKEY_workdir_default}}"
+pidfile="${OCF_RESKEY_pidfile:=${OCF_RESKEY_pidfile_default}}"
+#
+pseudoresource="runcommand_$process"
+
+runcommand_usage() {
+	cat <<END
+usage: $0 {start|stop|monitor|migrate_to|migrate_from|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+runcommand_start() {
+    # Check validity of configuration.
+    runcommand_validate || exit $?
+
+    # If already running, then finish early.
+    if ha_pseudo_resource $pseudoresource monitor
+    then
+	ocf_log info "Resource is already running."
+	return $OCF_SUCCESS
+    fi
+
+    # Start the pseudo resource.
+    ha_pseudo_resource $pseudoresource start || exit $?
+
+    # Run the start command.
+    ocf_run -q su - $user -s $SHELL -c "cd ${workdir} && ${startcommand}" || {
+	ha_pseudo_resource $pseudoresource stop
+	return $OCF_ERR_GENERIC
+    }
+
+    # Repetition
+    if [ -n "$repeat" ]; then
+	(
+	    exec < /dev/null > /dev/null 2>&1
+	    while true; do
+		sleep $(_runcommand_calctime "$repeat")
+		ocf_run -q su - $user -s $SHELL -c "cd ${workdir} && ${repeatcommand}"
+	    done &
+	    echo $(jobs -p) > "$pidfile" || {
+		ha_pseudo_resource $pseudoresource stop
+		return $OCF_ERR_GENERIC
+	    }
+	    disown -h
+	    disown 
+	)
+    fi
+
+    return $OCF_SUCCESS
+}
+
+runcommand_stop() {
+    if ha_pseudo_resource $pseudoresource monitor ; then
+        # Stop the repeat process
+	if [ -f "$pidfile" ]; then
+	    pid="$(_runcommand_getpid "$pidfile")"
+	    rm -f "$pidfile"
+	    kill $pid
+	fi
+
+	# Run the stop command, if given.
+	if [ -n "$stopcommand" ]; then
+	    ocf_run -q su - $user -s $SHELL -c "cd ${workdir} && ${stopcommand}" || {
+		ha_pseudo_resource $pseudoresource stop
+		return $OCF_ERR_GENERIC
+	    }
+	fi
+
+	# Mark as stopped.
+	ha_pseudo_resource $pseudoresource stop || exit $?
+	return $OCF_SUCCESS
+    else
+	ocf_log info "Resource is already stopped"
+	return $OCF_SUCCESS
+    fi
+}
+
+runcommand_monitor() {
+
+    # Run the probe.
+    ocf_run -q su - $user -s $SHELL -c "cd ${workdir} && ${probecommand}" || {
+	ha_pseudo_resource $pseudoresource stop
+	return $OCF_ERR_GENERIC
+    }
+
+    # Quick check...
+    ha_pseudo_resource $pseudoresource monitor || exit $?
+
+    # Look at the pidfile.
+    if [ -f "$pidfile" ]; then
+	if pid=$(_runcommand_getpid "$pidfile") && kill -0 $pid; then
+	    return $OCF_SUCCESS
+	else
+	    # pidfile w/o process means the process died
+	    ha_pseudo_resource $pseudoresource stop
+	    return $OCF_ERR_GENERIC
+	fi
+    else
+	# Assume no pidfile because we didn't need one.
+	return $OCF_SUCCESS
+    fi
+}
+
+runcommand_validate() {
+    if ! getent passwd $user >/dev/null 2>&1
+    then
+	ocf_log err "user $user does not exist."
+	exit $OCF_ERR_INSTALLED
+    fi
+    if [ -n "$workdir" ]; then
+	tf="$workdir/.x$$"
+	su - $user -s $SHELL -c "touch ${tf}" >/dev/null 2>&1 || {
+	    ocf_log err "$workdir does not exist or not writable by $user"
+	    exit $OCF_ERR_INSTALLED
+	}
+	rm "$tf"
+    fi
+    if [ -n "$repeat" ]; then
+	_runcommand_calctime "$repeat" > /dev/null 2>&1 || {
+	    ocf_log err "Can not compute dates from $repeat"
+	    exit $OCF_ERR_INSTALLED
+	}
+    fi
+
+    return $OCF_SUCCESS
+}
+
+case $__OCF_ACTION in
+meta-data)	meta_data
+		exit $OCF_SUCCESS
+		;;
+start)		runcommand_start;;
+stop)		runcommand_stop;;
+monitor)	runcommand_monitor;;
+migrate_to)	ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} to ${OCF_RESKEY_CRM_meta_migrate_target}."
+	        runcommand_stop
+		;;
+migrate_from)	ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} to ${OCF_RESKEY_CRM_meta_migrate_source}."
+	        runcommand_start
+		;;
+reload)		ocf_log err "Reloading..."
+	        runcommand_stop
+	        runcommand_start
+		;;
+validate-all)	runcommand_validate;;
+usage|help)	runcommand_usage
+		exit $OCF_SUCCESS
+		;;
+*)		runcommand_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc
+

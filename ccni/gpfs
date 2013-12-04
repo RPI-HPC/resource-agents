@@ -1,0 +1,224 @@
+#! /bin/bash
+#
+#
+#	gpfs OCF RA. Attempts to start GPFS and keep it running.  This
+#	can be used to make GPFS depend on network connections or
+#	other resources.
+#
+# Copyright (c) 2013 by Rensselaer Polytechnic Institute.
+#                       All rights reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+
+#######################################################################
+# Initialization:
+
+. ${OCF_ROOT}/resource.d/heartbeat/.ocf-shellfuncs
+
+#######################################################################
+
+# Define default values.
+OCF_RESKEY_fspath_default=""
+
+# Metadata
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="gpfs" version="1.0">
+<version>1.0</version>
+
+<longdesc lang="en">
+This is the gpfs Resource Agent. It starts up the IBM GPFS file system
+and monitors paths to make sure the file systems are mounted.
+
+GPFS should be configured to not automatically start when the node
+reboots.  This script will issue the "mmstartup" and "mmshutdown"
+commands as needed.
+</longdesc>
+<shortdesc lang="en">gpfs resource agent</shortdesc>
+
+<parameters>
+
+<parameter name="fspath" unique="0" required="0">
+<longdesc lang="en">
+Comma-separated paths in GPFS file system to test if GPFS is running
+and started.  Paths should exist only if the corresponding file system
+is mounted.  All paths must be found for the "monitor" method to
+succeed.
+</longdesc>
+<shortdesc lang="en">Comma-separated GPFS file system paths</shortdesc>
+<content type="string" default="$OCF_RESKEY_fspath_default" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="30s" />
+<action name="stop"         timeout="20s" />
+<action name="monitor"      timeout="20s" interval="60s" depth="0"/>
+<action name="reload"       timeout="30s" />
+<action name="validate-all" timeout="20s" />
+<action name="meta-data"    timeout="5s" />
+</actions>
+</resource-agent>
+END
+}
+
+
+# Get the variables we need
+process="$OCF_RESKEY_INSTANCE"
+fspath="${OCF_RESKEY_fspath:-${OCF_RESKEY_fspath_default}}"
+
+PATH=/usr/lpp/mmfs/bin:$PATH
+
+gpfs_usage() {
+	cat <<END
+usage: $0 {start|stop|monitor|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+
+gpfs_determine_state() {
+    mmgetstate | tail -1 | awk '{print $3}'
+}
+
+gpfs_status() {
+    # If the state is "down", check kernel modules.
+    state="$(gpfs_determine_state)"
+    if [ $state = "down" ]; then
+	if lsmod | grep -E -q 'tracedev|mmfslinux|mmfs26' ; then
+	    state="failed"
+	else
+	    state="stopped"
+	fi
+    fi
+    echo $state
+}
+
+gpfs_start() {
+    # If already running, then do no more.
+    if gpfs_monitor ; then
+	return $OCF_SUCCESS
+    fi
+
+    # Start up GPFS.
+    ocf_run  "mmstartup" || return $OCF_ERR_GENERIC
+
+    # Spin until started.
+    while ! gpfs_monitor ; do
+	sleep 5
+    done
+
+    return $OCF_SUCCESS
+}
+
+gpfs_stop() {
+    # Check validity of configuration.
+    gpfs_validate || echo $?
+
+    # If already stopped, then do no more.
+    state=$(gpfs_status)
+    if [ $state = "stopped" ]; then
+	return $OCF_SUCCESS
+    fi
+
+    # Attempt to shut down.
+    ocf_run -q "mmshutdown" || return $OCF_ERR_GENERIC
+
+    # Again check the status.
+    state=$(gpfs_status)
+    if [ $state = "stopped" ]; then
+	return $OCF_SUCCESS
+    fi
+    return $OCF_ERR_GENERIC
+}
+
+gpfs_monitor() {
+    # Check validity of configuration.
+    gpfs_validate || echo $?
+
+    # If there is a path, test it.
+#    if [ -n "$fspath" -a -e "$fspath" ]; then
+#	return $OCF_SUCCESS
+#    fi
+    if [ -n "$fspath" ]; then
+	oIFS="$IFS"
+	IFS=,
+	for p in $fspath; do
+	    [ -e "$p" ] || break
+	    p=
+	done
+	IFS="$oIFS"
+	[ -n "$p" ] || return $OCF_SUCCESS
+    fi
+
+    # Check the running state.
+    state=$(gpfs_status)
+    case $state in
+	stopped)
+	    return $OCF_NOT_RUNNING
+	    ;;
+	active)
+	    if [ -n "$fspath" ]; then
+		# We had a path, we are running, the path isn't accessible.
+		return $OCF_NOT_RUNNING
+	    fi
+	    return $OCF_SUCCESS
+	    ;;
+    esac
+    return $OCF_ERR_GENERIC
+}
+
+gpfs_validate() {
+    # Make sure we have the binaries.
+    for B in mmstartup mmshutdown mmgetstate; do
+	check_binary $B
+    done
+
+    return $OCF_SUCCESS
+}
+
+# Main program.
+case $__OCF_ACTION in
+meta-data)	meta_data
+		exit $OCF_SUCCESS
+		;;
+start)		gpfs_start;;
+stop)		gpfs_stop;;
+monitor)	gpfs_monitor;;
+reload)		ocf_log err "Reloading..."
+	        gpfs_stop
+	        gpfs_start
+		;;
+validate-all)	gpfs_validate;;
+usage|help)	gpfs_usage
+		exit $OCF_SUCCESS
+		;;
+*)		gpfs_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc

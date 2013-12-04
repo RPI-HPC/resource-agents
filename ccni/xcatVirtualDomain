@@ -1,0 +1,525 @@
+#! /bin/bash
+#
+#
+#	xcatVirtualDomain OCF RA. Starts up virtual machines defined
+#	using xCAT, on systems also using libvirt.
+#
+# Copyright (c) 2013 by Rensselaer Polytechnic Institute.
+#                       All rights reserved.
+# Copyright (c) 2008-2010 Florian Haas, Dejan Muhamedagic,
+#                         and Linux-HA contributors
+#
+# This contains code from the resource-agents package, modified by
+# Rensselaer Polytechnic Institute.  It is under the GNU Public
+# License (GPL).
+#
+#	usage: $0 {start|stop|status|monitor|migrate_to|migrate_from|meta-data|validate-all}
+#
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+. /etc/profile.d/xcat.sh
+
+NOW=$(date +%s)
+
+#######################################################################
+
+# Define default values.
+OCF_RESKEY_monitor_scripts_default=""
+OCF_RESKEY_force_stop_default=0
+#OCF_RESKEY_hypervisor_default="$(virsh --quiet uri)"
+OCF_RESKEY_autoset_utilization_cpu_default=true
+OCF_RESKEY_autoset_utilization_hv_memory_default=true
+OCF_RESKEY_migrateport_default=$(( 49152 + $(ocf_maybe_random) % 64 ))
+
+#######################################################################
+
+# Metadata
+
+meta_data() {
+    cat <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="xcatVirtualDomain" version="1.0">
+<version>1.0</version>
+
+<longdesc lang="en">
+This is the xcatVirtualDomain Resource Agent. It controls virtual machines
+using xCAT.
+</longdesc>
+<shortdesc lang="en">xcatVirtualDomain resource agent</shortdesc>
+
+<parameters>
+
+<parameter name="nodename" unique="1" required="1">
+<longdesc lang="en">
+Name of the virtual machine instance, which must also be the name of
+the system as known to xCAT.
+</longdesc>
+<shortdesc lang="en">Name of the VM</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="hypervisor" unique="0" required="0">
+<longdesc lang="en">
+Hypervisor URI to connect to. See the libvirt documentation for
+details on supported URI formats. The default is system dependent.
+Determine the system's default uri by running 'virsh --quiet uri'.
+</longdesc>
+<shortdesc lang="en">Hypervisor URI</shortdesc>
+<content type="string"/>
+</parameter>
+
+<parameter name="force_stop" unique="0" required="0">
+<longdesc lang="en">
+Always forcefully shut down ("destroy") the domain on stop. The default
+behavior is to resort to a forceful shutdown only after a graceful
+shutdown attempt has failed. You should only set this to true if
+your virtual domain (or your virtualization backend) does not support
+graceful shutdown.
+</longdesc>
+<shortdesc lang="en">Always force shutdown on stop</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_force_stop_default}" />
+</parameter>
+
+<parameter name="migration_transport" unique="0" required="0">
+<longdesc lang="en">
+Transport used to connect to the remote hypervisor while
+migrating. Please refer to the libvirt documentation for details on
+transports available. If this parameter is omitted, the resource will
+use libvirt's default transport to connect to the remote hypervisor.
+</longdesc>
+<shortdesc lang="en">Remote hypervisor transport</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="migration_network_suffix" unique="0" required="0">
+<longdesc lang="en">
+Use a dedicated migration network. The migration URI is composed by
+adding this parameters value to the end of the node name. If the node
+name happens to be an FQDN (as opposed to an unqualified host name),
+insert the suffix immediately prior to the first period (.) in the FQDN.
+At the moment Qemu/KVM and Xen migration via a dedicated network is supported.
+
+Note: Be sure this composed host name is locally resolveable and the
+associated IP is reachable through the favored network.
+</longdesc>
+<shortdesc lang="en">Migration network host name suffix</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="monitor_scripts" unique="0" required="0">
+<longdesc lang="en">
+To additionally monitor services within the virtual domain, add this
+parameter with a list of scripts to monitor.
+
+Note: when monitor scripts are used, the start and migrate_from operations
+will complete only when all monitor scripts have completed successfully.
+Be sure to set the timeout of these operations to accommodate this delay.
+</longdesc>
+<shortdesc lang="en">space-separated list of monitor scripts</shortdesc>
+<content type="string" default="$OCF_RESKEY_monitor_scripts_default" />
+</parameter>
+
+<parameter name="autoset_utilization_cpu" unique="0" required="0">
+<longdesc lang="en">
+If set true, the agent will detect the number of domainU's vCPUs from virsh, and put it 
+into the cpu utilization of the resource when the monitor is executed.
+</longdesc>
+<shortdesc lang="en">Enable auto setting the cpu utilization of the resource</shortdesc>
+<content type="boolean" default="$OCF_RESKEY_autoset_utilization_cpu_default" />
+</parameter>
+
+<parameter name="autoset_utilization_hv_memory" unique="0" required="0">
+<longdesc lang="en">
+If set true, the agent will detect the number of *Max memory* from virsh, and put it 
+into the hv_memory utilization of the resource when the monitor is executed.
+</longdesc>
+<shortdesc lang="en">Enable auto setting the hv_memory utilization of the resource</shortdesc>
+<content type="boolean" default="$OCF_RESKEY_autoset_utilization_hv_memory_default" />
+</parameter>
+
+<parameter name="migrateport" unique="0" required="0">
+<longdesc lang="en">
+This port will be used in the qemu migrateuri. If unset, the port will be a random highport.
+</longdesc>
+<shortdesc lang="en">Port for migrateuri</shortdesc>
+<content type="integer" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="90s" />
+<action name="stop"         timeout="90s" />
+<action name="status"       timeout="30s" interval="10s" depth="0"/>
+<action name="monitor"      timeout="30s" interval="10s" depth="0"/>
+<action name="migrate_to"   timeout="120s" />
+<action name="migrate_from" timeout="60s" />
+<action name="validate-all" timeout="5s" />
+<action name="meta-data"    timeout="5s" />
+</actions>
+</resource-agent>
+EOF
+}
+
+#######################################################################
+
+# Private functions
+
+set_util_attr() {
+    local attr=$1 val=$2
+    local cval outp
+
+    cval=$(crm_resource -Q -r $OCF_RESOURCE_INSTANCE -z -g $attr 2>/dev/null)
+    if [ "$cval" != "$val" ]; then
+       outp=`crm_resource -r $OCF_RESOURCE_INSTANCE -z -p $attr -v $val 2>&1` ||
+           ocf_log warn "crm_resource failed to set utilization attribute $attr: $outp"
+    fi
+}
+
+update_utilization() {
+    local dom_cpu dom_mem
+
+    if ocf_is_true "$OCF_RESKEY_autoset_utilization_cpu"; then
+       dom_cpu=$(LANG=C virsh $VIRSH_OPTIONS dominfo ${DOMAIN_NAME} 2>/dev/null | awk '/CPU\(s\)/{print $2}')
+       test -n "$dom_cpu" && set_util_attr cpu $dom_cpu
+    fi
+    if ocf_is_true "$OCF_RESKEY_autoset_utilization_hv_memory"; then
+       dom_mem=$(LANG=C virsh $VIRSH_OPTIONS dominfo ${DOMAIN_NAME} 2>/dev/null | awk '/Max memory/{printf("%d", $3/1024)}')
+       test -n "$dom_mem" && set_util_attr hv_memory "$dom_mem"
+    fi
+}
+
+
+#######################################################################
+
+# Get the variables we need.
+process="$OCF_RESOURCE_INSTANCE"
+nodename="$OCF_RESKEY_nodename"
+: ${OCF_RESKEY_force_stop=${OCF_RESKEY_force_stop_default}}
+#: ${OCF_RESKEY_hypervisor=${OCF_RESKEY_hypervisor_default}}
+: ${OCF_RESKEY_autoset_utilization_cpu=${OCF_RESKEY_autoset_utilization_cpu_default}}
+: ${OCF_RESKEY_autoset_utilization_hv_memory=${OCF_RESKEY_autoset_utilization_hv_memory_default}}
+: ${OCF_RESKEY_migrateport=${OCF_RESKEY_migrateport_default}}
+#
+vmhost=$(hostname -s)
+DOMAIN_NAME=$nodename
+VIRSH_OPTIONS=--quiet
+
+#######################################################################
+
+xcatVirtualDomain_Usage() {
+	cat <<END
+usage: $0 {start|stop|monitor|migrate_to|migrate_from|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+xcatVirtualDomain_Status() {
+    local try=0
+    rc=$OCF_ERR_GENERIC
+    status="no state"
+    while [ "$status" = "no state" ]; do
+	try=$(($try + 1 ))
+        status="$(LANG=C virsh $VIRSH_OPTIONS domstate $nodename 2>/dev/null || echo 'shut off')"
+        case "$status" in
+	    "shut off")
+	        # shut off: domain is defined, but not started
+		ocf_log debug "Virtual domain $DOMAIN_NAME is currently $status."
+	        rc=$OCF_NOT_RUNNING
+	        ;;
+	    running|paused|idle|blocked|"in shutdown")
+		# running: domain is currently actively consuming cycles
+		# paused: domain is paused (suspended)
+		# idle: domain is running but idle
+		# blocked: synonym for idle used by legacy Xen versions
+		# in shutdown: the domain is in process of shutting down, but has not completely shutdown or crashed.
+		ocf_log debug "Virtual domain $DOMAIN_NAME is currently $status."
+	        rc=$OCF_SUCCESS
+	        ;;
+            ""|"no state")
+		# Empty string may be returned when virsh does not
+		# receive a reply from libvirtd.
+		# "no state" may occur when the domain is currently
+		# being migrated (on the migration target only), or
+		# whenever virsh can't reliably obtain the domain
+		# state.
+		status="no state"
+		if [ "$__OCF_ACTION" = "stop" ] && [ $try -ge 3 ]; then
+		    # During the stop operation, we want to bail out
+		    # quickly, so as to be able to force-stop (destroy)
+		    # the domain if necessary.
+		    ocf_log error "Virtual domain $DOMAIN_NAME has no state during stop operation, bailing out."
+		    return $OCF_ERR_GENERIC;
+		else
+		    # During all other actions, we just wait and try
+		    # again, relying on the CRM/LRM to time us out if
+		    # this takes too long.
+		    ocf_log info "Virtual domain $DOMAIN_NAME currently has no state, retrying."
+		    sleep 1
+		fi
+		;;
+            *)
+		# any other output is unexpected.
+                ocf_log error "Virtual domain $DOMAIN_NAME has unknown status \"$status\"!"
+                ;;
+        esac
+    done
+    return $rc
+}
+
+xcatVirtualDomain_Start() {
+    # Is it already running here?  Reflect it in xCAT, and done.
+    if xcatVirtualDomain_Status ; then
+	ocf_log info "Virtual domain $nodename already running."
+	ocf_run chdef -t node -o "$nodename" vmhost="$vmhost" || return $OCF_ERR_GENERIC
+	return $OCF_SUCCESS
+    fi
+
+    # Make sure this is the VM host to be used. Turn it on with xCAT.
+    ocf_run chdef -t node -o "$nodename" vmhost="$vmhost" || return $OCF_ERR_GENERIC
+    ocf_run rpower "$nodename" on || return $OCF_ERR_GENERIC
+
+    # Wait for it to come on.
+    while ! xcatVirtualDomain_Monitor ;  do
+	sleep 1
+    done
+    return $OCF_SUCCESS
+}
+
+xcatVirtualDomain_Stop() {
+    local i
+    local status
+    local shutdown_timeout
+    local out ex
+
+    xcatVirtualDomain_Status
+    status=$?
+
+    case $status in
+	$OCF_SUCCESS)
+	    if ! ocf_is_true $OCF_RESKEY_force_stop; then
+		# Issue a graceful shutdown request
+		ocf_log info "Issuing graceful shutdown request for domain ${nodename}."
+		ocf_run rpower "$nodename" off || return $OCF_ERR_GENERIC
+	        # The "shutdown_timeout" we use here is the operation
+		# timeout specified in the CIB, minus 5 seconds
+		shutdown_timeout=$(( $NOW + (${OCF_RESKEY_CRM_meta_timeout=90}/1000) -5 ))
+		# Loop on status until we reach $shutdown_timeout
+		while [ $NOW -lt $shutdown_timeout ]; do
+		    xcatVirtualDomain_Status
+		    status=$?
+		    case $status in
+			$OCF_NOT_RUNNING)
+			    # This was a graceful shutdown. Clean
+			    # up and return.
+			    #xcatVirtualDomain_Cleanup_Statefile
+ 			    return $OCF_SUCCESS
+			    ;;
+			$OCF_SUCCESS)
+			    # Domain is still running, keep
+			    # waiting (until shutdown_timeout
+			    # expires)
+			    sleep 1
+			    ;;
+			*)
+			    # Something went wrong. Bail out and
+			    # resort to forced stop (destroy).
+			    break;
+		    esac
+		    NOW=$(date +%s)
+		done
+	    fi
+	    ;;
+	$OCF_NOT_RUNNING)
+	    ocf_log info "Domain $nodename_NAME already stopped."
+	    return $OCF_SUCCESS
+    esac
+    # OK. Now if the above graceful shutdown hasn't worked, kill
+    # off the domain with destroy. If that too does not work,
+    # have the LRM time us out.
+    ocf_log info "Issuing forced shutdown (destroy) request for domain ${nodename}."
+    out=$(LANG=C virsh $VIRSH_OPTIONS destroy "${nodename}" 2>&1)
+    ex=$?
+    echo >&2 "$out"
+    # unconditionally clean up.
+    #xcatVirtualDomain_Cleanup_Statefile
+    case $ex$out in
+	*"error:"*"domain is not running"*)
+	    : ;; # unexpected path to the intended outcome, all is well
+	[!0]*)
+	    return $OCF_ERR_GENERIC ;;
+	0*)
+	    while [ $status != $OCF_NOT_RUNNING ]; do
+		xcatVirtualDomain_Status
+		status=$?
+	    done ;;
+    esac
+    return $OCF_SUCCESS
+}
+
+xcatVirtualDomain_Migrate_To() {
+    local target_node
+    local remoteuri
+    local transport_suffix
+    local migrateuri
+    local migrateport
+    local migrate_target
+    local hypervisor
+
+    target_node="$OCF_RESKEY_CRM_meta_migrate_target"
+
+    if xcatVirtualDomain_Status; then
+        # Find out the remote hypervisor to connect to. That is, turn
+        # something like "qemu://foo:9999/system" into
+        # "qemu+tcp://bar:9999/system"
+	if [ -n "${OCF_RESKEY_migration_transport}" ]; then
+	    transport_suffix="+${OCF_RESKEY_migration_transport}"
+	fi
+	# A typical migration URI via a special  migration network looks
+	# like "tcp://bar-mig:49152". The port would be randomly chosen
+	# by libvirt from the range 49152-49215 if omitted, at least since
+	# version 0.7.4 ...
+	if [ -n "${OCF_RESKEY_migration_network_suffix}" ]; then
+	    hypervisor="${OCF_RESKEY_hypervisor%%[+:]*}"
+	    # Hostname might be a FQDN
+	    migrate_target=$(echo ${target_node} | sed -e "s,^\([^.]\+\),\1${OCF_RESKEY_migration_network_suffix},")
+	    case $hypervisor in
+		qemu)
+		    # For quiet ancient libvirt versions a migration port is needed
+		    # and the URI must not contain the "//". Newer versions can handle
+		    # the "bad" URI.
+		    migrateuri="tcp:${migrate_target}:${OCF_RESKEY_migrateport}"
+		    ;;
+		xen)
+		    migrateuri="xenmigr://${migrate_target}"
+		    ;;
+		*)
+		    ocf_log warn "$DOMAIN_NAME: Migration via dedicated network currently not supported for ${hypervisor}."
+		    ;;
+	    esac
+	fi
+        # Scared of that sed expression? So am I. :-)
+	remoteuri=$(echo ${OCF_RESKEY_hypervisor} | sed -e "s,\(.*\)://[^/:]*\(:\?[0-9]*\)/\(.*\),\1${transport_suffix}://${target_node}\2/\3,")
+
+	# OK, we know where to connect to. Now do the actual migration.
+	ocf_log info "$DOMAIN_NAME: Starting live migration to ${target_node} (using remote hypervisor URI ${remoteuri} ${migrateuri})."
+	ocf_run -q chdef -t node -o "$nodename" vmhost="$target_node" || {
+	    ocf_log err "${nodename}: live migration to ${target_node} failed (chdef)"
+	    return $OCF_ERR_GENERIC
+	}
+	LANG=C virsh ${VIRSH_OPTIONS} migrate --live $DOMAIN_NAME ${remoteuri} ${migrateuri}
+	rc=$?
+	if [ $rc -ne 0 ]; then
+	    ocf_log err "$DOMAIN_NAME: live migration to ${remoteuri} ${migrateuri} failed: $rc"
+	    return $OCF_ERR_GENERIC
+	else
+	    ocf_log info "$DOMAIN_NAME: live migration to ${target_node} succeeded."
+	    #xcatVirtualDomain_Cleanup_Statefile
+	    return $OCF_SUCCESS
+	fi
+    else
+	ocf_log err "$DOMAIN_NAME: migrate_to: Not active locally!"
+	return $OCF_ERR_GENERIC
+    fi
+}
+
+xcatVirtualDomain_Migrate_From() {
+    while ! xcatVirtualDomain_Monitor ;  do
+	sleep 1
+    done
+    return $OCF_SUCCESS
+}
+
+xcatVirtualDomain_Monitor() {
+    # First, check the domain status. If that returns anything other
+    # than $OCF_SUCCESS, something is definitely wrong.
+    xcatVirtualDomain_Status
+    rc=$?
+    if [ ${rc} -eq ${OCF_SUCCESS} ]; then
+	# OK, the generic status check turned out fine.  Now, if we
+	# have monitor scripts defined, run them one after another.
+	for script in ${OCF_RESKEY_monitor_scripts}; do
+	    script_output="$($script 2>&1)"
+	    script_rc=$?
+	    if [ ${script_rc} -ne ${OCF_SUCCESS} ]; then
+		# A monitor script returned a non-success exit
+		# code. Stop iterating over the list of scripts, log a
+		# warning message, and propagate $OCF_ERR_GENERIC.
+		ocf_log warn "Monitor command \"${script}\" for domain ${nodename} returned ${script_rc} with output: ${script_output}"
+		rc=$OCF_ERR_GENERIC
+		break
+	    else
+		ocf_log debug "Monitor command \"${script}\" for domain ${nodename} completed successfully with output: ${script_output}"
+	    fi
+	done
+    fi
+
+    update_utilization
+
+    return ${rc}
+}
+
+xcatVirtualDomain_Validate_All() {
+    local B
+    for B in rpower rmigrate chdef virsh sed ; do
+	check_binary $B
+    done
+}
+
+#######################################################################
+
+# Main program
+
+if [ $# -ne 1 ]; then
+  xcatVirtualDomain_Usage
+  exit $OCF_ERR_ARGS
+fi
+
+case $1 in
+  meta-data)		meta_data
+			exit $OCF_SUCCESS
+			;;
+  usage)		xcatVirtualDomain_Usage
+			exit $OCF_SUCCESS
+			;;
+esac
+
+# Everything except usage and meta-data must pass the validate test
+xcatVirtualDomain_Validate_All || exit $?
+
+OCF_RESKEY_hypervisor_default="$(virsh --quiet uri)"
+: ${OCF_RESKEY_hypervisor=${OCF_RESKEY_hypervisor_default}}
+
+case $1 in
+    start)
+	xcatVirtualDomain_Start
+	;;
+    stop)
+	xcatVirtualDomain_Stop
+	;;
+    migrate_to)
+	xcatVirtualDomain_Migrate_To
+	;;
+    migrate_from)
+	xcatVirtualDomain_Migrate_From
+	;;
+    status)
+	xcatVirtualDomain_Status
+	;;
+    monitor)
+	xcatVirtualDomain_Monitor
+        ;;
+    validate-all)
+	;;
+    *)
+	usage
+	exit $OCF_ERR_UNIMPLEMENTED
+	;;
+esac
+exit $?
